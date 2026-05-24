@@ -2,9 +2,10 @@
   "manifest_version": 3,
   "minimum_chrome_version": "116",
   "name": "Tab Reader (for Claude)",
-  "version": "1.0.0",
-  "description": "Reports the user's currently active Chrome tab to the local tab-reader MCP server so Claude Desktop can see it.",
-  "permissions": ["tabs"],
+  "version": "1.1.0",
+  "description": "Reports the user's currently active Chrome tab to the local tab-reader MCP server, and runs the live-DOM extractor when Claude Desktop asks for the tab's content.",
+  "permissions": ["tabs", "scripting"],
+  "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js"
   },

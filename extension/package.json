@@ -1,0 +1,15 @@
+{
+  "name": "tab-reader-extension",
+  "version": "1.0.0",
+  "description": "Chrome MV3 extension for tab-reader. Reports active tab to the MCP server and runs the live-DOM content-script extractor.",
+  "private": true,
+  "scripts": {
+    "build": "esbuild src/extractor.ts --bundle --outfile=dist/extractor.js --format=iife --target=chrome116 --platform=browser",
+    "watch": "esbuild src/extractor.ts --bundle --outfile=dist/extractor.js --format=iife --target=chrome116 --platform=browser --watch"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "turndown": "^7.2.4",
+    "turndown-plugin-gfm": "^1.0.2"
+  }
+}

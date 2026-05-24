@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 
 /**
- * tab-reader MCP server (v2.0)
+ * tab-reader MCP server
  *
  * Runs two things in one Node process:
  *   1. An MCP server over stdio (talks to Claude Desktop)
  *   2. A WebSocket server on port 17321 (the paired Chrome extension pushes
- *      tab updates here whenever the active tab changes)
+ *      tab updates here whenever the active tab changes; the server can also
+ *      send extraction requests to the extension over this socket)
  *
  * Shared state: `latestTab` — the most recent { url, title } the extension reported.
  *
@@ -18,21 +19,27 @@
  *     to documentation sites (e.g. Mintlify), where it strips step lists,
  *     callouts, and code-heavy sections because they score poorly on its
  *     content-density heuristic.
- *   - Instead: locate the main content root (<main> / <article> / <body>),
- *     surgically remove navigation/footer/sidebar/ads, normalize site-specific
- *     quirks (Mintlify step titles, heading permalinks), and hand the cleaned
- *     HTML to Turndown.
- *   - Result: faithful, near-lossless Markdown that preserves headings, code
- *     blocks (with language hints), tables, lists, and inline formatting,
- *     with no content silently dropped. Output is never truncated.
+ *   - The pipeline lives in ./pipeline.ts and is shared with the extension's
+ *     content script (bundled by esbuild). Single source of truth.
+ *   - Server path (this file): fetch HTML → jsdom → apply pipeline → Markdown.
+ *     Used as fallback when the extension is disconnected, or when the caller
+ *     does not request images.
+ *   - Extension path: live DOM → apply pipeline → interleaved text+image blocks.
+ *     Used when include_images=true (auth pages, JS-rendered, lazy-loaded).
  */
 
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { WebSocketServer, WebSocket } from "ws";
 import { JSDOM } from "jsdom";
-import TurndownService from "turndown";
-import { gfm } from "turndown-plugin-gfm";
+import { z } from "zod";
+import {
+  applyJunkSelectors,
+  makeTurndown,
+  normalizeDom,
+  pickContentRoot,
+} from "./pipeline.js";
 
 // ---------- shared state ----------
 
@@ -42,10 +49,34 @@ interface TabInfo {
   updatedAt: string;
 }
 
+type ContentBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string };
+
+interface ExtractionMeta {
+  rootKind?: string;
+  url?: string;
+  title?: string;
+}
+
+interface ExtractionResponse {
+  content: ContentBlock[];
+  meta: ExtractionMeta;
+}
+
+interface PendingRequest {
+  resolve: (value: ExtractionResponse) => void;
+  reject: (reason: unknown) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 let latestTab: TabInfo | null = null;
 let extensionConnected = false;
+let extensionSocket: WebSocket | null = null;
+const pendingRequests = new Map<string, PendingRequest>();
 
 const WS_PORT = 17321;
+const EXTRACTION_TIMEOUT_MS = 30_000;
 
 const USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
@@ -65,6 +96,7 @@ function startWebSocketServer() {
 
   wss.on("connection", (socket: WebSocket) => {
     extensionConnected = true;
+    extensionSocket = socket;
     console.error("[tab-reader] Chrome extension connected");
 
     socket.on("message", (raw) => {
@@ -79,30 +111,65 @@ function startWebSocketServer() {
         return;
       }
 
+      let parsed: unknown;
       try {
-        const parsed = JSON.parse(text);
-        if (
-          typeof parsed === "object" &&
-          parsed !== null &&
-          typeof parsed.url === "string" &&
-          typeof parsed.title === "string"
-        ) {
-          latestTab = {
-            url: parsed.url,
-            title: parsed.title,
-            updatedAt: new Date().toISOString(),
-          };
-          console.error(`[tab-reader] Tab updated: ${latestTab.title} — ${latestTab.url}`);
-        } else {
-          console.error("[tab-reader] Ignored malformed message:", parsed);
-        }
+        parsed = JSON.parse(text);
       } catch (err) {
         console.error("[tab-reader] Failed to parse WS message:", err);
+        return;
       }
+
+      if (typeof parsed !== "object" || parsed === null) {
+        console.error("[tab-reader] Ignored non-object message");
+        return;
+      }
+
+      const msg = parsed as Record<string, unknown>;
+
+      // Response to a server-initiated extraction request.
+      if (msg.type === "response" && typeof msg.id === "string") {
+        const pending = pendingRequests.get(msg.id);
+        if (!pending) {
+          console.error(`[tab-reader] Response for unknown request id: ${msg.id}`);
+          return;
+        }
+        clearTimeout(pending.timer);
+        pendingRequests.delete(msg.id);
+        if (msg.ok) {
+          const content = Array.isArray(msg.content) ? (msg.content as ContentBlock[]) : [];
+          const meta: ExtractionMeta =
+            msg.meta && typeof msg.meta === "object" ? (msg.meta as ExtractionMeta) : {};
+          pending.resolve({ content, meta });
+        } else {
+          const err = typeof msg.error === "string" ? msg.error : "Extension reported failure";
+          pending.reject(new Error(err));
+        }
+        return;
+      }
+
+      // Tab update (legacy shape: { url, title } with no `type` field).
+      if (typeof msg.url === "string" && typeof msg.title === "string") {
+        latestTab = {
+          url: msg.url,
+          title: msg.title,
+          updatedAt: new Date().toISOString(),
+        };
+        console.error(`[tab-reader] Tab updated: ${latestTab.title} — ${latestTab.url}`);
+        return;
+      }
+
+      console.error("[tab-reader] Ignored malformed message:", msg);
     });
 
     socket.on("close", () => {
       extensionConnected = false;
+      if (extensionSocket === socket) extensionSocket = null;
+      // Reject any in-flight extraction requests; the extension can't answer them now.
+      for (const [id, pending] of pendingRequests) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error("Extension disconnected before responding"));
+        pendingRequests.delete(id);
+      }
       console.error("[tab-reader] Chrome extension disconnected");
     });
 
@@ -116,218 +183,68 @@ function startWebSocketServer() {
   });
 }
 
-// ---------- HTML → Markdown ----------
-
 /**
- * Configure Turndown to produce high-fidelity Markdown:
- *   - ATX-style headings (#, ##, ###)
- *   - Fenced code blocks with language hints when available
- *   - GFM tables, strikethrough, task lists
- *   - Inline-style links
- *   - Clean <img> tags with just src + alt (drop srcset/sizes/data-* noise)
+ * Ask the connected extension to extract the current tab's content.
+ * Sends a request over the WebSocket and awaits the matching response by id.
+ * Rejects if the extension is not connected, the timeout elapses, or the
+ * extension reports a failure.
  */
-function makeTurndown(): TurndownService {
-  const td = new TurndownService({
-    headingStyle: "atx",
-    codeBlockStyle: "fenced",
-    fence: "```",
-    bulletListMarker: "*",
-    emDelimiter: "*",
-    strongDelimiter: "**",
-    linkStyle: "inlined",
+function requestExtraction(includeImages: boolean): Promise<ExtractionResponse> {
+  if (!extensionSocket || extensionSocket.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error("Extension not connected"));
+  }
+  const id = randomUUID();
+  const socket = extensionSocket;
+  return new Promise<ExtractionResponse>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingRequests.delete(id);
+      reject(new Error(`Extension request timed out after ${EXTRACTION_TIMEOUT_MS}ms`));
+    }, EXTRACTION_TIMEOUT_MS);
+    pendingRequests.set(id, { resolve, reject, timer });
+    try {
+      socket.send(JSON.stringify({
+        type: "request",
+        id,
+        op: "extract",
+        params: { includeImages },
+      }));
+    } catch (err) {
+      clearTimeout(timer);
+      pendingRequests.delete(id);
+      reject(err);
+    }
   });
-
-  td.use(gfm);
-
-  // Drop noise tags. Using a filter function rather than .remove(["svg",...])
-  // because some tag names aren't in TS's HTMLElementTagNameMap.
-  const dropTags = new Set([
-    "SCRIPT",
-    "STYLE",
-    "NOSCRIPT",
-    "IFRAME",
-    "SVG",
-    "LINK",
-    "META",
-  ]);
-  td.addRule("drop-noise", {
-    filter: (node) => dropTags.has(node.nodeName),
-    replacement: () => "",
-  });
-
-  // <img>: emit a clean inline tag with just essential attributes.
-  td.addRule("clean-img", {
-    filter: "img",
-    replacement: (_content, node) => {
-      const el = node as unknown as {
-        getAttribute(name: string): string | null;
-      };
-      const src = el.getAttribute("src") ?? "";
-      if (!src) return "";
-      const alt = (el.getAttribute("alt") ?? "").replace(/"/g, "&quot;");
-      const w = el.getAttribute("width");
-      const h = el.getAttribute("height");
-      const dims = w && h ? ` width="${w}" height="${h}"` : "";
-      return `<img src="${src}" alt="${alt}"${dims}>`;
-    },
-  });
-
-  // <pre><code class="language-foo">...</code></pre> → fenced block with lang.
-  td.addRule("fenced-code-with-lang", {
-    filter: (node) => {
-      if (node.nodeName !== "PRE") return false;
-      const first = node.firstChild as { nodeName?: string } | null;
-      return !!first && first.nodeName === "CODE";
-    },
-    replacement: (_content, node) => {
-      const codeEl = (node as unknown as { firstChild: Element }).firstChild;
-      const className = codeEl.getAttribute?.("class") ?? "";
-      const langMatch = /language-([^\s]+)/.exec(className);
-      const lang = langMatch ? langMatch[1] : "";
-      const text = codeEl.textContent ?? "";
-      const body = text.replace(/\n$/, "");
-      return `\n\n\`\`\`${lang}\n${body}\n\`\`\`\n\n`;
-    },
-  });
-
-  return td;
 }
+
+// ---------- HTML → Markdown (server-side path, used when the extension is offline) ----------
 
 const turndown = makeTurndown();
 
 interface ExtractedContent {
   title: string | null;
   markdown: string;
-  /** Which strategy succeeded: "main", "article", "body", or "fallback". */
+  /** Which strategy succeeded: "main", "article", "role-main", "id-content", "body". */
   rootKind: string;
 }
-
-/**
- * Site-specific normalizations applied to the DOM before conversion.
- * Each is small and targeted; they never remove content that could be
- * meaningful, only restructure or strip noise.
- */
-function normalizeDom(doc: Document): void {
-  // Mintlify renders <Step title="Foo"> as a nested div tree where the title
-  // ends up in a <p data-component-part="step-title">. Promote those to <h4>
-  // so they survive as Markdown headings.
-  doc.querySelectorAll('[data-component-part="step-title"]').forEach((el) => {
-    const h = doc.createElement("h4");
-    h.textContent = el.textContent ?? "";
-    el.replaceWith(h);
-  });
-
-  // Many doc sites (Mintlify, Docusaurus, MkDocs) wrap heading text in
-  // permalink <a> tags. Turndown then renders the heading as several lines
-  // of brackets and arrows. Replace each heading's content with plain text.
-  for (let level = 1; level <= 6; level++) {
-    doc.querySelectorAll(`h${level}`).forEach((h) => {
-      const text = (h.textContent ?? "")
-        .replace(/\s+/g, " ")
-        .replace(/\u200B/g, "") // zero-width space
-        .trim();
-      h.textContent = text;
-    });
-  }
-
-  // Some Mintlify pages use <span data-as="p"> instead of <p>. Convert so
-  // Markdown sees them as proper paragraphs.
-  doc.querySelectorAll('span[data-as="p"]').forEach((el) => {
-    const p = doc.createElement("p");
-    p.innerHTML = el.innerHTML;
-    el.replaceWith(p);
-  });
-}
-
-/**
- * Selectors for elements that are almost always noise.
- * Kept conservative — we want to keep all real content.
- */
-const JUNK_SELECTORS = [
-  // standard noise
-  "script",
-  "style",
-  "noscript",
-  "iframe",
-  "svg",
-  "link",
-  "meta",
-  // site chrome
-  "nav",
-  "header > nav",
-  "footer",
-  "aside",
-  "[role='navigation']",
-  "[role='banner']",
-  "[role='contentinfo']",
-  "[role='complementary']",
-  "[aria-hidden='true']",
-  ".sidebar",
-  ".toc",
-  ".table-of-contents",
-  ".breadcrumb",
-  ".skip-link",
-  ".cookie-banner",
-  ".newsletter",
-  "[class*='advertisement']",
-  "[class*='social-share']",
-  // heading permalinks (Mintlify, Docusaurus, etc.)
-  "a.header-anchor",
-  "a[href^='#'][aria-label*='ermalink']",
-  // Mintlify step number badges / rails (rendered icons, no text content)
-  "[data-component-part='step-number']",
-  "[data-component-part='step-rail']",
-  "[data-component-part='step-marker']",
-];
 
 function extractContent(html: string, url: string): ExtractedContent {
   const dom = new JSDOM(html, { url });
   const doc = dom.window.document;
 
-  // Strip universally-junk elements first (these are NEVER content).
-  for (const sel of JUNK_SELECTORS) {
-    doc.querySelectorAll(sel).forEach((n) => n.remove());
-  }
-
-  // Site-specific DOM normalizations (Mintlify, etc.).
+  applyJunkSelectors(doc);
   normalizeDom(doc);
-
-  // Pick the main content root, in priority order.
-  let rootKind = "fallback";
-  let root: Element | null = doc.querySelector("main");
-  if (root) {
-    rootKind = "main";
-  } else {
-    root = doc.querySelector("article");
-    if (root) {
-      rootKind = "article";
-    } else {
-      root = doc.querySelector("[role='main']");
-      if (root) {
-        rootKind = "role-main";
-      } else {
-        root = doc.querySelector("#content") ?? doc.querySelector(".content");
-        if (root) {
-          rootKind = "id-content";
-        } else {
-          root = doc.body;
-          rootKind = "body";
-        }
-      }
-    }
-  }
+  const { root, kind: rootKind } = pickContentRoot(doc);
 
   const title =
     doc.title?.trim() ||
     doc.querySelector("h1")?.textContent?.trim() ||
     null;
 
-  const htmlToConvert = root ? root.innerHTML : "";
-  const rawMd = turndown.turndown(htmlToConvert).trim();
+  const rawMd = turndown.turndown(root.innerHTML).trim();
 
   // Post-process: collapse extra blank lines, strip zero-width spaces.
   const markdown = rawMd
-    .replace(/\u200B/g, "") // zero-width space
+    .replace(/​/g, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 
@@ -406,7 +323,7 @@ async function fetchAndExtract(url: string): Promise<FetchResult> {
 
 const server = new McpServer({
   name: "tab-reader",
-  version: "2.0.0",
+  version: "2.1.0",
 });
 
 server.registerTool(
@@ -463,11 +380,27 @@ server.registerTool(
       "whatever tab the user currently has active. " +
       "Output preserves structure: headings (#, ##), code blocks with language hints, " +
       "lists, tables, links, and inline formatting. No truncation. " +
-      "Performs a server-side HTTP GET, so it only works for publicly accessible pages " +
-      "(no logged-in content, intranet, or chrome:// pages).",
-    inputSchema: {},
+      "Set include_images=true when the user wants Claude to actually see the images " +
+      "embedded in the page (screenshots, diagrams, figures). Images are returned " +
+      "interleaved with the article text in section-aligned order — each image appears " +
+      "in the response right after the text of its section. Requires the Chrome " +
+      "extension to be connected; works on logged-in pages and JS-rendered content. " +
+      "Default false (text-only). With include_images=false this performs a server-side " +
+      "HTTP GET and only works for publicly accessible pages.",
+    inputSchema: {
+      include_images: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "When true, return images embedded in the page interleaved with the article " +
+            "text in section-aligned order. Requires the Chrome extension to be connected.",
+        ),
+    },
   },
-  async () => {
+  async (args) => {
+    const includeImages = args?.include_images === true;
+
     if (!latestTab) {
       const hint = extensionConnected
         ? "The Chrome extension is connected but hasn't reported a tab yet."
@@ -486,8 +419,76 @@ server.registerTool(
             type: "text",
             text:
               `Can't fetch ${url} — only http(s) URLs are supported. ` +
-              `Pages like chrome://, file://, or extension pages aren't reachable from ` +
-              `a server-side fetch. The user is currently on "${latestTab.title}".`,
+              `Pages like chrome://, file://, or extension pages aren't reachable. ` +
+              `The user is currently on "${latestTab.title}".`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    // Prefer the extension path whenever it's connected — it works on
+    // logged-in pages, JS-rendered content, and lazy-loaded images. The
+    // server-side fetch path below is the fallback for when it isn't.
+    if (extensionConnected) {
+      try {
+        console.error(`[tab-reader] Requesting extraction from extension (includeImages=${includeImages}) for ${url}`);
+        const started = Date.now();
+        const { content: extracted, meta } = await requestExtraction(includeImages);
+        const durationMs = Date.now() - started;
+        const actualUrl = meta.url ?? url;
+        const actualTitle = meta.title ?? latestTab.title;
+        console.error(
+          `[tab-reader] Extraction returned ${extracted.length} block(s) in ${durationMs}ms` +
+            (meta.rootKind ? ` (root: ${meta.rootKind})` : ""),
+        );
+        const headerLines = [
+          `URL: ${actualUrl}`,
+          `Title: ${actualTitle}`,
+          `Source: extension`,
+          `Mode: include_images=${includeImages}`,
+          `Extracted in: ${durationMs}ms`,
+        ];
+        if (meta.rootKind) headerLines.push(`Root: <${meta.rootKind}>`);
+        if (actualUrl !== url) {
+          headerLines.push(
+            `Note: active tab changed during extraction (server expected ${url}; extracted ${actualUrl}).`,
+          );
+        }
+        const header: ContentBlock = {
+          type: "text",
+          text: headerLines.join("\n") + "\n\n---\n",
+        };
+        return { content: [header, ...extracted] };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[tab-reader] Extension extraction failed: ${message}`);
+        if (includeImages) {
+          // Images can only be sourced from the extension — no fallback possible.
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Extension extraction failed: ${message}. ` +
+                  `Retry, or call without include_images for text-only via server-side fetch.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        // Text-only: fall through to server-side fetch.
+        console.error(`[tab-reader] Falling back to server-side fetch`);
+      }
+    } else if (includeImages) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `include_images=true requires the Chrome extension to be connected, ` +
+              `but it isn't right now. Either ask the user to enable the extension, ` +
+              `or retry without include_images (text-only, via server-side fetch).`,
           },
         ],
         isError: true,
@@ -548,7 +549,7 @@ async function main() {
   startWebSocketServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("[tab-reader] MCP server connected on stdio (v2.0.0)");
+  console.error("[tab-reader] MCP server connected on stdio (v2.1.0)");
 }
 
 main().catch((err) => {
