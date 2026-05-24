@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "minimum_chrome_version": "116",
+  "name": "Tab Reader (for Claude)",
+  "version": "1.0.0",
+  "description": "Reports the user's currently active Chrome tab to the local tab-reader MCP server so Claude Desktop can see it.",
+  "permissions": ["tabs"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icon.png",
+    "48": "icon.png",
+    "128": "icon.png"
+  }
+}
