@@ -1,6 +1,6 @@
 {
   "name": "tab-reader-server",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "MCP server that exposes the user's active browser tab to Claude Desktop via a paired Chrome extension.",
   "type": "module",
   "bin": {
@@ -8,7 +8,11 @@
   },
   "scripts": {
     "build": "tsc && chmod 755 build/index.js",
-    "start": "node build/index.js"
+    "start": "node build/index.js",
+    "install-daemon": "node scripts/install-daemon.js",
+    "uninstall-daemon": "node scripts/uninstall-daemon.js",
+    "reload-daemon": "node scripts/reload-daemon.js",
+    "status-daemon": "node scripts/status-daemon.js"
   },
   "files": [
     "build"

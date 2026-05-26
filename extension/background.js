@@ -15,7 +15,11 @@ const WS_URL = "ws://127.0.0.1:17321";
 const KEEPALIVE_IDLE_MS = 20_000;
 const KEEPALIVE_BUSY_MS = 10_000;
 const RECONNECT_INITIAL_MS = 1_000;
-const RECONNECT_MAX_MS = 30_000;
+// Capped low because the tab-reader daemon (LaunchAgent) is supposed to be
+// always-on. Long backoffs would leave the extension disconnected for
+// tens of seconds after a daemon restart, which `npm run reload-daemon`
+// and launchd KeepAlive both make a regular event.
+const RECONNECT_MAX_MS = 5_000;
 
 let webSocket = null;
 let keepAliveIntervalId = null;
@@ -248,7 +252,15 @@ async function handleRequest(req) {
  * frame). Re-running step 1 is safe and idempotent — the bundle just
  * re-assigns window.__tabReader, which is what we want when the page has
  * navigated since the last call.
+ *
+ * Extractions on the same tab are serialised via a per-tab promise chain.
+ * Without this, two concurrent extract requests would both re-inject the
+ * bundle (re-assigning window.__tabReader between the load step and the
+ * call step) and race on the in-page state. Concurrency across DIFFERENT
+ * tabs is still parallel.
  */
+const extractionChains = new Map(); // tabId → Promise chain of in-flight/queued extractions
+
 async function runExtractor(params) {
   const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   if (!tab || typeof tab.id !== "number") {
@@ -258,16 +270,35 @@ async function runExtractor(params) {
     throw new Error(`Cannot inject into browser-internal page: ${tab.url}`);
   }
 
+  const tabId = tab.id;
+  const previous = extractionChains.get(tabId) ?? Promise.resolve();
+  // Catch on the previous link so one extraction's failure doesn't
+  // poison the queue for the next caller — but our own work's failure
+  // propagates to our caller via the returned `next` promise.
+  const next = previous
+    .catch(() => {})
+    .then(() => extractActiveTab(tabId, params));
+  extractionChains.set(tabId, next);
+  try {
+    return await next;
+  } finally {
+    if (extractionChains.get(tabId) === next) {
+      extractionChains.delete(tabId);
+    }
+  }
+}
+
+async function extractActiveTab(tabId, params) {
   // Step 1 of 2: load the extractor bundle.
   await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
+    target: { tabId },
     files: [EXTRACTOR_FILE],
     world: "ISOLATED",
   });
 
   // Step 2 of 2: call extract(params) and return its result.
   const results = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
+    target: { tabId },
     world: "ISOLATED",
     func: (args) => {
       const tr = window.__tabReader;
