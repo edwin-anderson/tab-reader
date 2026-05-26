@@ -17,13 +17,7 @@ invariants, change workflows), see [HANDOVER.md](HANDOVER.md).
 
 ## What it does
 
-Two MCP tools exposed to Claude Desktop:
-
-### `get_current_tab`
-Returns `{ url, title, lastUpdated, extensionConnected }`. Cheap and fast.
-The extension is constantly pushing the active tab over WebSocket; the
-server just reads the latest cached value. Use when the user refers to
-"this page", "this tab", or "what I'm reading".
+One MCP tool exposed to Claude Desktop:
 
 ### `fetch_current_tab`
 Returns the FULL content of the active tab as Markdown. Two modes:
@@ -215,7 +209,6 @@ break an MCP server — don't.
 
 | Scenario | Latency | Notes |
 |---|---|---|
-| `get_current_tab` | < 10 ms | Pure read of in-memory state. |
 | `fetch_current_tab`, text-only, extension connected | ~100–350 ms | Live DOM read, no HTTP. ~30× faster than v2.0. |
 | `fetch_current_tab`, text-only, fallback | ~300 ms – 1.5 s | Server HTTP GET + JSDOM. v2.0 behavior. |
 | `fetch_current_tab`, with images (typical, ≤10 cached) | ~600 ms – 1.2 s | Parallel browser-cache fetches dominate. |

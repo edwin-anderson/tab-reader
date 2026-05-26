@@ -24,8 +24,7 @@ Chrome extension ──WebSocket──> MCP server (Node) <──stdio── Cla
     live-DOM extractor)
 ```
 
-The server exposes two tools to Claude Desktop:
-- **`get_current_tab`** — returns `{ url, title, lastUpdated, extensionConnected }`. Cheap.
+The server exposes one MCP tool to Claude Desktop:
 - **`fetch_current_tab`** — returns the current tab as Markdown. When called
   with `include_images: true`, returns text and images **interleaved by
   section**: each image block appears in the response right after the text of
@@ -142,7 +141,7 @@ rejected with "Extension disconnected before responding".
    shared pipeline from `./pipeline.ts` against jsdom. Used only when the
    extension is disconnected.
 5. **`fetchAndExtract`** — HTTP GET + `extractContent` for the fallback path.
-6. **MCP server + tool registrations** (`get_current_tab`, `fetch_current_tab`).
+6. **MCP server + tool registration** (`fetch_current_tab`).
 7. **`main()`** — boots both servers.
 
 ---
@@ -574,7 +573,9 @@ After any change:
    ```
 
 4. **Tools respond:**
-   - "what tab am I on?" → `get_current_tab` → URL + title.
+   - "what tab am I on?" → `fetch_current_tab` → URL + title from the
+     response header (full extraction runs, but the header is what
+     Claude answers from).
    - "summarize this page" → `fetch_current_tab` (default text-only via
      extension) → Markdown with `Source: extension` in the header.
    - "show me this page including the images" → `fetch_current_tab`

@@ -49,7 +49,7 @@ const USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
     "AppleWebKit/537.36 (KHTML, like Gecko) " +
     "Chrome/124.0.0.0 Safari/537.36";
 const FETCH_TIMEOUT_MS = 20_000;
-const VERSION = "2.2.0";
+const VERSION = "3.0.0";
 // ---------- extension WebSocket handler (path "/") ----------
 function handleExtensionConnection(socket) {
     if (extensionSocket && extensionSocket.readyState === WebSocket.OPEN) {
@@ -234,44 +234,16 @@ async function fetchAndExtract(url) {
 }
 // ---------- tool registration (run per /mcp connection) ----------
 function registerTools(server) {
-    server.registerTool("get_current_tab", {
-        description: "Returns the URL and title of the browser tab the user is currently looking at. " +
-            "Use this when the user refers to 'this page', 'this tab', 'what I'm reading', " +
-            "or otherwise expects you to know what they have open in their browser. " +
-            "Cheap and fast — does not fetch the page content. Pair with fetch_current_tab " +
-            "when the user wants the actual content of the page. " +
-            "Requires the paired Chrome extension to be installed and Chrome to be running.",
-        inputSchema: {},
-    }, async () => {
-        if (!latestTab) {
-            const hint = extensionConnected
-                ? "The Chrome extension is connected but hasn't reported a tab yet."
-                : "The Chrome extension isn't connected.";
-            return {
-                content: [{ type: "text", text: `No tab info available. ${hint}` }],
-                isError: true,
-            };
-        }
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: JSON.stringify({
-                        url: latestTab.url,
-                        title: latestTab.title,
-                        lastUpdated: latestTab.updatedAt,
-                        extensionConnected,
-                    }, null, 2),
-                },
-            ],
-        };
-    });
     server.registerTool("fetch_current_tab", {
         description: "Fetches the FULL content of the browser tab the user is currently looking at, " +
             "as high-fidelity Markdown. Use this whenever the user asks about, refers to, " +
             "wants to discuss, summarize, or learn from the page they have open " +
             "(e.g. 'what is this page about', 'summarize this', 'explain this section', " +
-            "'what does this article say'). Does NOT need a URL argument — it always fetches " +
+            "'what does this article say'). Also use when the user asks 'what tab am I on?', " +
+            "'what URL is this?', or just wants the page title — the response header always " +
+            "includes URL and title. Skip for incidental mentions, hypotheticals, or " +
+            "follow-ups on already-extracted content. " +
+            "Does NOT need a URL argument — it always fetches " +
             "whatever tab the user currently has active. " +
             "Output preserves structure: headings (#, ##), code blocks with language hints, " +
             "lists, tables, links, and inline formatting. No truncation. " +

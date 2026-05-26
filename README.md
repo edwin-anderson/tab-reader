@@ -36,13 +36,13 @@ which figure belongs to which heading.
   bridges can connect simultaneously — Claude Desktop and Claude Code
   share the daemon and the extension without stepping on each other.
 
-Two MCP tools:
+One MCP tool:
 
-- **`get_current_tab`** — returns `{ url, title }`. Cheap.
-- **`fetch_current_tab`** — returns the page as Markdown. Set
-  `include_images: true` to get embedded images as MCP image blocks
-  interleaved with the article text. Works on logged-in pages and JS-
-  rendered content (because the extraction happens in the user's browser).
+- **`fetch_current_tab`** — returns the page as Markdown, with URL and
+  title in the response header. Set `include_images: true` to get
+  embedded images as MCP image blocks interleaved with the article text.
+  Works on logged-in pages and JS-rendered content (because the
+  extraction happens in the user's browser).
 
 Three pieces — the daemon, the Claude config, and the Chrome extension.
 Requires macOS and Chrome 116+.
@@ -143,15 +143,15 @@ In Claude Desktop or Claude Code, ask:
 
 > What tab am I on right now?
 
-Claude should call `get_current_tab` and answer with the URL + title of
-your active Chrome tab.
+Claude should call `fetch_current_tab` and answer with the URL + title
+from the response header.
 
 Then try:
 
 > Summarize this page.
 
-Claude should call `fetch_current_tab` and respond from the page's
-Markdown.
+Claude should call `fetch_current_tab` again and respond from the
+page's Markdown.
 
 For images aligned with the article structure:
 

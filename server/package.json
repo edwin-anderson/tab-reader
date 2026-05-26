@@ -1,6 +1,6 @@
 {
   "name": "tab-reader-server",
-  "version": "2.2.0",
+  "version": "3.0.0",
   "description": "MCP server that exposes the user's active browser tab to Claude Desktop via a paired Chrome extension.",
   "type": "module",
   "bin": {
